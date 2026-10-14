@@ -5,6 +5,7 @@ A collection of polished, high-density statuslines for AI coding assistants and 
 ## Supported Agents
 
 - **[Antigravity CLI (`agy`)](./antigravity-cli)**: 4-line statusline featuring model, effort, user, device, git branch, 1M context bar, session timer, cost, and 5h/weekly quota meters.
+- **[Claude Code](./claude-code)**: 4-line statusline featuring model, project, device, user, git branch, context-window bar, session timer, cost, and 5h/weekly rate-limit meters. Bash and PowerShell versions, with installers.
 
 ## Contributing
 

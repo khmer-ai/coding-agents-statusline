@@ -109,7 +109,7 @@ t_path = d.get("transcript_path") or ""
 if not os.path.exists(t_path):
     conv_id = d.get("conversation_id") or d.get("session_id") or ""
     if conv_id:
-        alt = f"/home/finte/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl"
+        alt = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl")
         if os.path.exists(alt):
             t_path = alt
 

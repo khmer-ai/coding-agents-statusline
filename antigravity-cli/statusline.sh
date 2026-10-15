@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Antigravity CLI / Claude Code status line — 4-line layout, brand colors, progress bars.
+# Antigravity CLI status line — 4-line layout, brand colors, progress bars.
 # Reads session JSON on stdin.
 # Requires: bash 3.2+  python3  (no jq or other installs needed)
 set -euo pipefail
@@ -16,8 +16,15 @@ printf '%s' "$input" > "$_tmpjson"
 cat > "$_tmppython" << 'PYEOF'
 import json, sys, math, time, subprocess, os
 
-with open(sys.argv[1]) as fp:
-    d = json.load(fp)
+try:
+    with open(sys.argv[1]) as fp:
+        raw = fp.read().strip()
+        d = json.loads(raw) if raw else {}
+except Exception:
+    d = {}
+
+if not isinstance(d, dict):
+    d = {}
 
 ctx    = d.get("context_window") or {}
 cost   = d.get("cost")           or {}
@@ -30,6 +37,11 @@ vcs    = d.get("vcs")            or {}
 
 cdir      = ws.get("current_dir") or d.get("cwd") or ""
 cdir_last = cdir.replace("\\", "/").rstrip("/").split("/")[-1] if cdir else ""
+if not cdir_last:
+    try:
+        cdir_last = os.path.basename(os.getcwd())
+    except Exception:
+        cdir_last = ""
 
 # Rate limits / Quota (Claude Code & Antigravity)
 five_h  = rl.get("five_hour")
@@ -70,9 +82,10 @@ week_reset = (seven_d.get("resets_at") or 0) if isinstance(seven_d, dict) else 0
 
 # Git branch resolution
 branch = ws.get("git_worktree") or ws.get("branch") or vcs.get("branch") or ""
-if not branch and cdir:
+target_dir = cdir or os.getcwd()
+if not branch and target_dir:
     try:
-        r = subprocess.run(["git", "-C", cdir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=0.5)
+        r = subprocess.run(["git", "-C", target_dir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=0.5)
         if r.returncode == 0:
             b = r.stdout.strip()
             if b != "HEAD":
@@ -92,9 +105,9 @@ elif isinstance(effort, str):
 # Lines added / removed
 added = cost.get("total_lines_added") or 0
 removed = cost.get("total_lines_removed") or 0
-if added == 0 and removed == 0 and cdir:
+if added == 0 and removed == 0 and target_dir:
     try:
-        r = subprocess.run(["git", "-C", cdir, "diff", "--numstat", "HEAD"], capture_output=True, text=True, timeout=0.5)
+        r = subprocess.run(["git", "-C", target_dir, "diff", "--numstat", "HEAD"], capture_output=True, text=True, timeout=0.5)
         if r.returncode == 0:
             for line in r.stdout.splitlines():
                 parts = line.split()
@@ -107,11 +120,24 @@ if added == 0 and removed == 0 and cdir:
 # Transcript path resolution
 t_path = d.get("transcript_path") or ""
 if not os.path.exists(t_path):
-    conv_id = d.get("conversation_id") or d.get("session_id") or ""
+    conv_id = d.get("conversation_id") or d.get("session_id") or d.get("cascade_id") or ""
     if conv_id:
         alt = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl")
         if os.path.exists(alt):
             t_path = alt
+if not os.path.exists(t_path):
+    brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
+    if os.path.isdir(brain_dir):
+        try:
+            candidates = [
+                os.path.join(brain_dir, c, ".system_generated", "logs", "transcript.jsonl")
+                for c in os.listdir(brain_dir)
+            ]
+            valid = [p for p in candidates if os.path.isfile(p)]
+            if valid:
+                t_path = max(valid, key=os.path.getmtime)
+        except Exception:
+            pass
 
 rows = [
     model.get("display_name")       or "?",
@@ -136,6 +162,8 @@ PYEOF
 
 F=()
 while IFS= read -r __line; do F+=("$__line"); done < <(python3 "$_tmppython" "$_tmpjson")
+
+(( ${#F[@]} < 16 )) && exit 0
 
 MODEL=${F[0]}; MODEL_ID=${F[1]}; IN_TOK=${F[3]}; CTX_WIN=${F[4]}
 COST=${F[5]}; ADDED=${F[6]}; REMOVED=${F[7]}
@@ -217,15 +245,21 @@ progress_bar() {
   printf '%s' "$bar"
 }
 
+# file_birth_epoch <path> — cross-platform "file created" time
+file_birth_epoch() {
+  local f=$1 t=""
+  t=$(stat -c '%W' "$f" 2>/dev/null) || true
+  { [ -z "$t" ] || [ "$t" = "0" ]; } && { t=$(stat -c '%Y' "$f" 2>/dev/null) || true; }
+  { [ -z "$t" ] || [ "$t" = "0" ]; } && { t=$(stat -f '%B' "$f" 2>/dev/null) || true; }
+  { [ -z "$t" ] || [ "$t" = "0" ]; } && { t=$(stat -f '%m' "$f" 2>/dev/null) || true; }
+  [[ "$t" =~ ^[0-9]+$ ]] || t=0
+  printf '%s' "$t"
+}
+
 # --- Wall-clock session timer (cross-platform) --------------------------------
 wall_secs=0
 if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    sess_start=$(stat -f '%B' "$TRANSCRIPT" 2>/dev/null || echo 0)
-  else
-    sess_start=$(stat -c '%W' "$TRANSCRIPT" 2>/dev/null || echo 0)
-    (( sess_start == 0 )) && sess_start=$(stat -c '%Y' "$TRANSCRIPT" 2>/dev/null || echo 0)
-  fi
+  sess_start=$(file_birth_epoch "$TRANSCRIPT")
   if (( sess_start > 0 )); then
     wall_secs=$(( $(date +%s) - sess_start ))
     (( wall_secs < 0 )) && wall_secs=0
@@ -240,17 +274,56 @@ case "$MODEL_ID" in
   *)        MDL_ICON="✦" ;;
 esac
 
-# --- User & Device -----------------------------------------------------------
-SYS_USER=$(id -un 2>/dev/null || echo "${USER:-}")
-SYS_HOST=$(hostname -s 2>/dev/null || uname -n 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "${HOSTNAME:-}")
-SYS_HOST=${SYS_HOST%%.*}
+# --- Device model + username (cached — hardware queries are slow) ------------
+CACHE_DIR="${HOME:-/tmp}/.gemini/antigravity-cli"
+CACHE_FILE="$CACHE_DIR/.statusline-device-cache"
+USER_NAME="${USER:-${USERNAME:-$(whoami 2>/dev/null || id -un 2>/dev/null || echo "")}}"
+
+DEVICE_MODEL=""
+[ -f "$CACHE_FILE" ] && { DEVICE_MODEL=$(cat "$CACHE_FILE" 2>/dev/null) || true; }
+
+if [ -z "$DEVICE_MODEL" ]; then
+  OS_KIND=$(uname -s 2>/dev/null) || OS_KIND=""
+  case "$OS_KIND" in
+    Darwin)
+      MODEL_NAME=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/{print $2; exit}') || true
+      RES=$(system_profiler SPDisplaysDataType 2>/dev/null | awk '/Resolution:/{print $2"x"$4; exit}') || true
+      case "$RES" in                                    # native-res → screen size
+        3456x2234|3072x1920) SIZE=" 16" ;;
+        3024x1964)           SIZE=" 14" ;;
+        2880x1800|2880x1864) SIZE=" 15" ;;
+        2560x1600|2560x1664) SIZE=" 13" ;;
+        *)                   SIZE=""    ;;
+      esac
+      DEVICE_MODEL="${MODEL_NAME}${SIZE}"
+      ;;
+    Linux)
+      DEVICE_MODEL=$(cat /sys/class/dmi/id/product_name 2>/dev/null) || true
+      ;;
+    MINGW*|MSYS*|CYGWIN*)                               # Git Bash / MSYS on Windows
+      DEVICE_MODEL=$(wmic csproduct get name 2>/dev/null | awk 'NR==2{$1=$1; print}') || true
+      if [ -z "$DEVICE_MODEL" ]; then
+        DEVICE_MODEL=$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_ComputerSystem).Model' 2>/dev/null | tr -d '\r') || true
+      fi
+      ;;
+  esac
+  # Fallback to hostname if device model could not be determined
+  if [ -z "$DEVICE_MODEL" ]; then
+    DEVICE_MODEL=$(hostname -s 2>/dev/null || uname -n 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "${HOSTNAME:-}")
+    DEVICE_MODEL=${DEVICE_MODEL%%.*}
+  fi
+  if [ -n "$DEVICE_MODEL" ]; then
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+    printf '%s' "$DEVICE_MODEL" > "$CACHE_FILE" 2>/dev/null || true
+  fi
+fi
 
 # ─── LINE 1 ─ Model :effort │ 👤 user │ 💻 device │ 📂 Project ⎇ Branch │ ✏️ +add/−rm ─
 L1="${MODEL_CLR}${B}${MDL_ICON} ${MODEL}${R}"
 [ -n "$EFFORT" ] && L1+=" ${GREY}:${EFFORT}${R}"
-[ -n "$SYS_USER" ] && L1+="${SEP}${USER_CLR}👤 ${SYS_USER}${R}"
-[ -n "$SYS_HOST" ] && L1+="${SEP}${HOST_CLR}💻 ${SYS_HOST}${R}"
-L1+="${SEP}${DIR_CLR}${B}📂 ${DIR}${R}"
+[ -n "$USER_NAME" ] && L1+="${SEP}${USER_CLR}👤 ${USER_NAME}${R}"
+[ -n "$DEVICE_MODEL" ] && L1+="${SEP}${HOST_CLR}💻 ${DEVICE_MODEL}${R}"
+[ -n "$DIR" ] && L1+="${SEP}${DIR_CLR}${B}📂 ${DIR}${R}"
 [ -n "$BRANCH" ] && L1+="  ${GREY}⎇${R}  ${DIR_CLR}${BRANCH}${R}"
 if (( ADDED > 0 || REMOVED > 0 )); then
   L1+="${SEP}${GREY}✏️${R}  ${BAR_FILL}+${ADDED}${R}${GREY} / ${R}${DANGER_CLR}−${REMOVED}${R}"
@@ -283,4 +356,6 @@ fi
 printf '%b\n' "$L1"
 printf '%b\n' "$L2"
 printf '%b\n' "$L3"
-[ -n "$L4" ] && printf '%b\n' "$L4" || true
+[ -n "$L4" ] && printf '%b\n' "$L4"
+
+exit 0
